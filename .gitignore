@@ -1,0 +1,6 @@
+.glm_cookies.json
+glm-snatch.log
+node_modules/
+package.json
+package-lock.json
+.npmrc
