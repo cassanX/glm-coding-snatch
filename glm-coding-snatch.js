@@ -19,30 +19,14 @@ const fs = require('fs');
 // 配置区 - 按需修改
 // ============================
 const CONFIG = {
-  // === 目标套餐 ===
-  // 'lite' | 'pro' | 'max'
-  plan: 'pro',
-
-  // === 付费周期 ===
-  // 'monthly' | 'quarterly' | 'yearly'
-  cycle: 'monthly',
-
-  // === Chrome 路径 (自动检测) ===
-  chromePath: 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
-
-  // === 桌面通知 ===
+  plan: 'pro',                  // lite | pro | max
+  cycle: 'monthly',             // monthly | quarterly | yearly
+  windowCount: 3,               // 同时抢购的窗口数量
+  chromePath: '',               // 留空=自动使用 Playwright 内置 Chromium
   enableNotifications: true,
-
-  // === 抢到后是否自动打开付款页 ===
   autoOpenPayment: true,
-
-  // === 轮询间隔 (毫秒) ===
-  pollIntervalMs: 3000,
-
-  // === 超时时间 (毫秒)，0 = 永不超时 ===
-  timeoutMs: 0,
-
-  // === 登录状态是否持久化(Cookie) ===
+  pollIntervalMs: 1000,         // 轮询间隔
+  timeoutMs: 0,                 // 超时(毫秒)，0=永不
   persistCookies: true,
 };
 
@@ -53,14 +37,9 @@ const SITE_URL = 'https://open.bigmodel.cn';
 const CODING_PLAN_URL = `${SITE_URL}/glm-coding`;
 const COOKIE_FILE = path.join(__dirname, '.glm_cookies.json');
 const LOG_FILE = path.join(__dirname, 'glm-snatch.log');
-
 const PLAN_IDS = { lite: 0, pro: 1, max: 2 };
-
-const CYCLE_LABELS = {
-  monthly: '连续包月',
-  quarterly: '连续包季',
-  yearly: '连续包年',
-};
+const PLAN_LABELS = { lite: 'Lite', pro: 'Pro', max: 'Max' };
+const CYCLE_LABELS = { monthly: '连续包月', quarterly: '连续包季', yearly: '连续包年' };
 
 // ============================
 // 日志
@@ -74,8 +53,9 @@ function log(msg, isError = false) {
 }
 
 // ============================
-// 桌面通知
+// 桌面通知 (只通知一次)
 // ============================
+let notified = false;
 async function notify(title, body) {
   log(`[通知] ${title}: ${body}`);
   if (!CONFIG.enableNotifications) return;
@@ -97,12 +77,9 @@ async function notify(title, body) {
 function loadCookies() {
   if (!CONFIG.persistCookies) return null;
   try {
-    if (fs.existsSync(COOKIE_FILE)) {
+    if (fs.existsSync(COOKIE_FILE))
       return JSON.parse(fs.readFileSync(COOKIE_FILE, 'utf-8'));
-    }
-  } catch (e) {
-    log(`加载 Cookie 失败: ${e.message}`, true);
-  }
+  } catch (e) { log(`加载 Cookie 失败: ${e.message}`, true); }
   return null;
 }
 
@@ -111,156 +88,188 @@ function saveCookies(cookies) {
   try {
     fs.writeFileSync(COOKIE_FILE, JSON.stringify(cookies, null, 2));
     log(`Cookie 已保存 (${cookies.length} 条)`);
-  } catch (e) {
-    log(`保存 Cookie 失败: ${e.message}`, true);
-  }
+  } catch (e) { log(`保存 Cookie 失败: ${e.message}`, true); }
 }
 
 // ============================
-// 浏览器 & 页面管理
+// 浏览器 & Context 管理
 // ============================
-let browser, page;
+let browser;
 
 async function initBrowser(headless = false) {
   log(`启动浏览器 (headless: ${headless})...`);
-  browser = await chromium.launch({
-    headless,
-    executablePath: CONFIG.chromePath,
-    args: ['--no-sandbox', '--disable-blink-features=AutomationControlled'],
-  });
+  const launchOpts = { headless, args: ['--no-sandbox'] };
+  if (CONFIG.chromePath && fs.existsSync(CONFIG.chromePath))
+    launchOpts.executablePath = CONFIG.chromePath;
+  browser = await chromium.launch(launchOpts);
+}
+
+async function createContext() {
   const ctx = await browser.newContext({
     viewport: { width: 1920, height: 1080 },
     locale: 'zh-CN',
     timezoneId: 'Asia/Shanghai',
-    userAgent:
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
-      '(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
   });
-  page = await ctx.newPage();
-  const savedCookies = loadCookies();
-  if (savedCookies && savedCookies.length > 0) {
-    await ctx.addCookies(savedCookies);
-    log('已加载已保存的登录状态');
+  const page = await ctx.newPage();
+  const cookies = loadCookies();
+  if (cookies?.length > 0) {
+    await ctx.addCookies(cookies);
   }
-  return { browser, page, ctx };
+  return { ctx, page };
 }
 
-async function ensureLoggedIn() {
+async function ensureLoggedIn(page) {
   log('导航到 GLM Coding Plan 页面...');
-  await page.goto(CODING_PLAN_URL, { waitUntil: 'networkidle', timeout: 30000 });
-  await page.waitForTimeout(3000);
-
-  const loginBtn = page.locator('button:has-text("登录 / 注册")');
-  const consoleLink = page.locator('a[href*="/console"]');
-
-  if ((await consoleLink.count()) > 0) {
-    log('检测到已登录状态');
-    return true;
+  try {
+    await page.goto(CODING_PLAN_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    await page.waitForTimeout(2000);
+  } catch (e) {
+    log(`页面加载耗时较长，继续执行...`);
   }
 
-  if ((await loginBtn.count()) > 0) {
+  // 关闭弹窗
+  for (const text of ['我知道了', '暂不订阅', '取消']) {
+    try { await page.locator(`button:has-text("${text}")`).first().click({ timeout: 2000 }); } catch {}
+  }
+
+  // 检测登录状态
+  let needsLogin = false;
+  try { needsLogin = await page.locator('button:has-text("登录 / 注册")').first().isVisible({ timeout: 3000 }); } catch {}
+
+  if (needsLogin) {
     log('=== 需要登录 ===');
     log('请在浏览器窗口中完成登录 (手机号 + 短信验证码)');
     log('登录完成后，回到终端按 Enter 继续...');
     await new Promise((resolve) => process.stdin.once('data', () => resolve()));
     await page.waitForTimeout(2000);
-    const cookies = await page.context().cookies();
-    saveCookies(cookies);
+    saveCookies(await page.context().cookies());
     log('登录检测完成');
-    return true;
-  }
 
-  log('登录状态不确定，请在浏览器中确认登录后按 Enter...');
-  await new Promise((resolve) => process.stdin.once('data', () => resolve()));
-  const cookies = await page.context().cookies();
-  saveCookies(cookies);
-  return true;
+    // 登录成功后，把 cookie 同步给其他窗口
+    const cookies = await page.context().cookies();
+    const contexts = browser.contexts();
+    for (const ctx of contexts) {
+      try { await ctx.addCookies(cookies); } catch {}
+    }
+  } else {
+    log('检测到已登录状态');
+  }
 }
 
 // ============================
-// 抢购核心逻辑
+// 获取所有套餐按钮及其状态
 // ============================
-async function startSnatching() {
+async function getPlanButtons(page) {
+  try { await page.locator('text=个人套餐').first().click({ timeout: 2000 }); } catch {}
+  await page.waitForTimeout(500);
+
+  const allBtns = page.locator('button');
+  const count = await allBtns.count();
+  const result = [];
+
+  for (let i = 0; i < count; i++) {
+    const btn = allBtns.nth(i);
+    let text = '', disabled = true;
+    try { text = (await btn.innerText()).trim(); } catch { continue; }
+    if (!text) continue;
+    if (!text.includes('特惠订阅') && !text.includes('暂时售罄') && !text.includes('前往认证')) continue;
+    try { disabled = await btn.isDisabled(); } catch { disabled = true; }
+    result.push({ text, disabled, locator: btn });
+  }
+  return result;
+}
+
+// ============================
+// 单窗口抢购循环
+// ============================
+async function snatchInWindow(page, label, signal) {
   const planKey = CONFIG.plan;
   const planIndex = PLAN_IDS[planKey];
+  const planLabel = PLAN_LABELS[planKey];
   const cycleLabel = CYCLE_LABELS[CONFIG.cycle];
   const startTime = Date.now();
-
-  if (planIndex === undefined) {
-    log(`错误: 未知套餐 "${planKey}"，可选: lite, pro, max`, true);
-    return;
-  }
-
-  log('');
-  log('========================================');
-  log(`开始抢购 GLM Coding Plan`);
-  log(`目标套餐: ${planKey.toUpperCase()} (${cycleLabel})`);
-  log(`轮询间隔: ${CONFIG.pollIntervalMs}ms`);
-  log(`超时: ${CONFIG.timeoutMs === 0 ? '永不' : CONFIG.timeoutMs + 'ms'}`);
-  log('========================================');
-  log('');
-
   let attempts = 0;
 
-  while (true) {
+  log(`[${label}] 开始抢购 ${planKey.toUpperCase()} (${cycleLabel})`);
+
+  while (!signal.aborted) {
     attempts++;
     const elapsed = Date.now() - startTime;
 
     if (CONFIG.timeoutMs > 0 && elapsed > CONFIG.timeoutMs) {
-      log(`超时: 已持续 ${Math.round(elapsed / 1000)} 秒，停止抢购`);
+      log(`[${label}] 超时退出`);
       break;
     }
 
     try {
-      log(`[第 ${attempts} 次检查] 刷新页面...`);
-      await page.goto(CODING_PLAN_URL, { waitUntil: 'networkidle', timeout: 30000 });
-      await page.waitForTimeout(2000);
+      log(`[${label}][${attempts}] 加载页面...`);
+      try {
+        await page.goto(CODING_PLAN_URL, { waitUntil: 'domcontentloaded', timeout: 20000 });
+        await page.waitForTimeout(1500);
+      } catch (e) {
+        try {
+          const ctx = page.context();
+          await page.close().catch(() => {});
+          page = await ctx.newPage();
+          await page.goto(CODING_PLAN_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
+          await page.waitForTimeout(2000);
+        } catch (e2) {
+          log(`[${label}] 页面重建失败: ${e2.message}`);
+          await sleep(CONFIG.pollIntervalMs);
+          continue;
+        }
+      }
 
-      const subscribeBtns = page.locator('button:has-text("特惠订阅")');
-      const btnCount = await subscribeBtns.count();
+      // 关闭弹窗
+      for (const text of ['我知道了', '暂不订阅', '取消']) {
+        try { await page.locator(`button:has-text("${text}")`).first().click({ timeout: 1000 }); } catch {}
+      }
 
-      if (btnCount === 0) {
-        log('  未找到"特惠订阅"按钮，可能页面未完全加载');
+      await page.waitForTimeout(500);
+      const planBtns = await getPlanButtons(page);
+
+      if (planBtns.length <= planIndex) {
+        log(`[${label}] 未能定位到套餐按钮 (找到 ${planBtns.length} 个)`);
         await sleep(CONFIG.pollIntervalMs);
         continue;
       }
 
-      log(`  找到 ${btnCount} 个特惠订阅按钮`);
-      const targetBtn = subscribeBtns.nth(planIndex);
-      const isDisabled = await targetBtn.isDisabled().catch(() => true);
-      const isVisible = await targetBtn.isVisible().catch(() => false);
+      const target = planBtns[planIndex];
+      log(`[${label}] ${planLabel}: "${target.text}" (disabled: ${target.disabled})`);
 
-      log(`  目标套餐 (${planKey.toUpperCase()}): visible=${isVisible}, disabled=${isDisabled}`);
-
-      if (isVisible && !isDisabled) {
+      if (target.text.includes('特惠订阅') && !target.disabled) {
         log('');
-        log('★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★');
-        log('★  发现可用订阅! 开始抢购!');
-        log('★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★');
+        log(`[${label}] ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★`);
+        log(`[${label}] ★  发现可用订阅! 开始抢购!`);
+        log(`[${label}] ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★`);
 
         await notify('GLM Coding Plan 抢购',
           `发现 ${planKey.toUpperCase()} (${cycleLabel}) 可用，正在抢购...`);
 
-        await targetBtn.click();
+        await target.locator.click();
         await page.waitForTimeout(3000);
 
-        if (CONFIG.cycle !== 'monthly') {
+        // 选择付费周期
+        if (cycleLabel !== '连续包月') {
           try {
             const cycleSel = page.locator(`text="${cycleLabel}"`);
             if ((await cycleSel.count()) > 0) {
               await cycleSel.first().click();
               await page.waitForTimeout(1000);
-              log(`  已选择付费周期: ${cycleLabel}`);
+              log(`[${label}] 已选择付费周期: ${cycleLabel}`);
             }
           } catch (e) {
-            log(`  选择付费周期需手动操作: ${e.message}`);
+            log(`[${label}] 选择付费周期需手动操作: ${e.message}`);
           }
         }
 
-        log('  已打开订阅页，请在浏览器中完成支付');
+        log(`[${label}] 已打开订阅页，请在浏览器中完成支付`);
 
-        await notify('🎉 抢购成功!',
-          `GLM Coding Plan ${planKey.toUpperCase()} (${cycleLabel}) 已打开，请完成支付!`);
+        if (!notified) {
+          notified = true;
+          await notify('🎉 抢购成功!',
+            `GLM Coding Plan ${planKey.toUpperCase()} (${cycleLabel}) 已打开，请完成支付!`);
+        }
 
         if (CONFIG.autoOpenPayment) {
           try {
@@ -270,25 +279,26 @@ async function startSnatching() {
             const orderBtn = payBtn.or(confirmBtn).or(submitBtn);
             if ((await orderBtn.count()) > 0) {
               await orderBtn.first().click();
-              log('  已自动点击支付/确认');
+              log(`[${label}] 已自动点击支付/确认`);
               await page.waitForTimeout(3000);
             }
           } catch {}
         }
 
-        log('抢购流程完成，请检查浏览器支付状态');
-        return;
-      } else {
-        const reason = isDisabled ? '按钮不可用(已抢完/未到时间)' : '按钮不可见';
-        log(`  目标套餐暂不可用: ${reason}`);
+        log(`[${label}] 抢购流程完成`);
+        // 通知其他窗口停止
+        process.nextTick(() => { try { signal.abort(); } catch {} });
+        return true;
       }
     } catch (e) {
-      log(`  检查出错: ${e.message}`, true);
+      log(`[${label}] 出错: ${e.message}`, true);
     }
 
-    log(`  等待 ${CONFIG.pollIntervalMs / 1000} 秒后重试...`);
     await sleep(CONFIG.pollIntervalMs);
   }
+
+  log(`[${label}] 已停止`);
+  return false;
 }
 
 function sleep(ms) {
@@ -300,17 +310,40 @@ function sleep(ms) {
 // ============================
 async function main() {
   const headless = process.argv.includes('--headless');
-  log('GLM Coding Plan 抢购脚本 v1.0');
-  log('=============================');
+  log('GLM Coding Plan 抢购脚本 v1.1 (多窗口)');
+  log('========================================');
   try {
     await initBrowser(headless);
-    await ensureLoggedIn();
-    await startSnatching();
+
+    // 创建 N 个独立窗口
+    const windows = [];
+    for (let i = 0; i < CONFIG.windowCount; i++) {
+      windows.push(await createContext());
+    }
+    log(`已创建 ${CONFIG.windowCount} 个抢购窗口`);
+
+    // 第一个窗口负责登录
+    await ensureLoggedIn(windows[0].page);
+
+    // 并行启动所有窗口的抢购
+    const ac = new AbortController();
+
+    const results = await Promise.all(
+      windows.map((w, i) =>
+        snatchInWindow(w.page, `窗口${i + 1}`, ac.signal)
+      )
+    );
+
+    if (results.some(r => r === true)) {
+      log('✅ 抢购成功!');
+    } else {
+      log('所有窗口已停止');
+    }
   } catch (e) {
     log(`致命错误: ${e.message}`, true);
     console.error(e);
   } finally {
-    if (browser) await browser.close();
+    if (browser) await browser.close().catch(() => {});
     log('浏览器已关闭');
     log('脚本结束');
     process.exit(0);
