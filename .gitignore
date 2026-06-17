@@ -4,3 +4,5 @@ node_modules/
 package.json
 package-lock.json
 .npmrc
+CLAUDE.md
+debug_screenshot.png
